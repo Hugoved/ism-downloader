@@ -128,6 +128,14 @@ try:
                 "bitrate": int(quality.get("Bitrate", "0") or 0),
                 "codec": codec,
                 "codec_private_data": quality.get("CodecPrivateData", "") or "",
+                "fps": (
+                    parser_module.get_real_fps_from_codec_private_data(
+                        codec,
+                        quality.get("CodecPrivateData", "") or "",
+                    )
+                    if hasattr(parser_module, "get_real_fps_from_codec_private_data")
+                    else None
+                ),
                 "timescale": int(root.get("TimeScale", stream_index.get("TimeScale", "10000000"))),
                 "duration": manifest_duration,
                 "pssh": pssh,
@@ -313,7 +321,8 @@ try:
 
         if track["media_type"] == "video":
             size = f"{track['width']}x{track['height']}" if track["width"] and track["height"] else "unknown size"
-            label = f"VIDEO | {track['codec']} | {size} | {bitrate_text} | chunks={len(track['chunk_times'])}"
+            fps_text = f" | fps={track['fps']:g}" if track.get("fps") else ""
+            label = f"VIDEO | {track['codec']} | {size}{fps_text} | {bitrate_text} | chunks={len(track['chunk_times'])}"
         else:
             label = (
                 f"AUDIO | {track['language']} | {track['codec']} | "
@@ -432,6 +441,7 @@ try:
                 "is_drm_protected": selected_track["is_drm_protected"],
                 "codec": str(selected_track["codec"]).lower(),
                 "codec_private_data": selected_track["codec_private_data"],
+                "fps": selected_track.get("fps"),
                 "channels": selected_track["channels"],
                 "bits": selected_track["bits"],
                 "sample_rate": selected_track["sample_rate"],
