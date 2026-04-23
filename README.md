@@ -11,6 +11,8 @@ A Python-based tool for downloading and reconstructing media from **Microsoft Sm
 * Generates valid **MP4/PIFF initialization segments**
 * Supports **DRM metadata (PlayReady / Widevine PSSH)**
 * Automatic bitrate probing for better track selection
+* **FPS detection from codec private data (AVC / HEVC)** 
+* Improved codec parsing and stream metadata accuracy
 * Interactive track selection
 
 ---
@@ -20,11 +22,12 @@ A Python-based tool for downloading and reconstructing media from **Microsoft Sm
 * Python 3.9+
 * `requests`
 * `inquirer` (optional, for interactive menu)
+* `bitstring` (required for advanced codec parsing) 
 
 Installation:
 
 ```bash
-pip install requests inquirer
+pip install requests inquirer bitstring
 ```
 
 ---
@@ -49,7 +52,7 @@ Some features were added to expand the scope of the project beyond its initial p
 ## Issues and Support
 
 If you encounter any issues, please open an issue in the repository.
-Support and maintenance will be provided as time permits.
+I will try to provide support and maintain this project as time permits.
 
 ---
 
