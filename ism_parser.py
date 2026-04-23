@@ -4,6 +4,7 @@ import base64
 import binascii
 import re
 import inspect
+import bitstring
 from struct import Struct
 
 u8 = Struct(">B")
@@ -28,6 +29,348 @@ SELF_CONTAINED = 0x1
 PLAYREADY_SYSTEM_ID = "9a04f07998404286ab92e65be0885f95"
 WIDEVINE_SYSTEM_ID = "edef8ba979d64acea3c827dcd51d21ed"
 START_CODE = b"\x00\x00\x00\x01"
+
+
+def to_rbsp(oldStr):
+    newStr = oldStr
+
+    while True:
+        iter_matches = re.finditer("00000300|00000301|00000302", oldStr)
+        ll = [m.start(0) for m in iter_matches]
+        if ll == []:
+            break
+
+        indices = [x for x in ll if x & 1 == 0]
+        if indices == []:
+            break
+
+        s = 0
+        for k in indices:
+            tmpStr = newStr[0 : k - s] + oldStr[k:].replace("000003", "0000", 1)
+            s += 2
+            newStr = tmpStr
+
+        oldStr = newStr
+
+    return newStr
+
+
+def read_past_scaling_matrix(s, matrix_size):
+    next_scale = 8
+    last_scale = 8
+
+    for _ in range(matrix_size):
+        if next_scale:
+            delta_scale = s.read("se")
+            next_scale = (last_scale + delta_scale + 256) & 0xFF
+        if next_scale:
+            last_scale = next_scale
+
+
+def parse_avc_sps(data) -> dict:
+    spsLen = len(data)
+    ret = {}
+
+    c = bitstring.BitArray(bytes=data, length=spsLen * 8)
+    newStr = to_rbsp(c.hex)
+    s = bitstring.BitStream("0x" + newStr)
+
+    s.read("uint:16")
+    ret["profile"] = s.read("uint:8")
+    ret["profile_compatibility"] = s.read("uint:8")
+    ret["level"] = s.read("uint:8")
+    ret["parameter_id"] = s.read("ue")
+    ret["chroma_format_idc"] = 1
+    if ret["profile"] == 138:
+        ret["chroma_format_idc"] = 0
+
+    if ret["profile"] in [100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135]:
+        ret["chroma_format_idc"] = s.read("ue")
+        if ret["chroma_format_idc"] == 3:
+            ret["separate_colour_plane_flag"] = s.read("uint:1")
+
+        ret["bit_depth_luma"] = s.read("ue") + 8
+        ret["bit_depth_chroma"] = s.read("ue") + 8
+        ret["qp_prime_y_zero_transform_bypass_flag"] = s.read("uint:1")
+        ret["seq_scaling_matrix_present_flag"] = s.read("uint:1")
+        if ret["seq_scaling_matrix_present_flag"]:
+            for k in range(8):
+                seq_scaling_list_present_flag = s.read("uint:1")
+                if seq_scaling_list_present_flag:
+                    if k < 6:
+                        read_past_scaling_matrix(s, 16)
+                    else:
+                        read_past_scaling_matrix(s, 64)
+
+    ret["log2_max_frame_num"] = s.read("ue") + 4
+    ret["pic_order_cnt_type"] = s.read("ue")
+    if ret["pic_order_cnt_type"] == 0:
+        ret["log2_max_pic_order_cnt_lsb"] = s.read("ue") + 4
+    elif ret["pic_order_cnt_type"] == 1:
+        ret["delta_pic_order_always_zero_flag"] = s.read("uint:1")
+        ret["offset_for_non_ref_pic"] = s.read("ue")
+        ret["offset_for_top_to_bottom_field"] = s.read("ue")
+        num_ref_frames_in_pic_order_cnt_cycle = s.read("ue")
+        ret["ref_frames_in_pic_order_cnt_cycle"] = []
+        for _ in range(num_ref_frames_in_pic_order_cnt_cycle):
+            ret["ref_frames_in_pic_order_cnt_cycle"].append(s.read("ue"))
+
+    ret["num_ref_frames"] = s.read("ue")
+    ret["gaps_in_frame_num_value_allowed_flag"] = s.read("uint:1")
+    ret["width"] = (s.read("ue") + 1) * 16
+    ret["height"] = (s.read("ue") + 1) * 16
+
+    ret["frame_mbs_only_flag"] = frame_mbs_only = s.read("uint:1")
+    if not ret["frame_mbs_only_flag"]:
+        ret["mb_adaptive_frame_field_flag"] = s.read("uint:1")
+        ret["height"] *= 2
+
+    ret["direct_8x8_inference_flag"] = s.read("uint:1")
+    ret["frame_cropping_flag"] = s.read("uint:1")
+
+    if ret["frame_cropping_flag"]:
+        if ret["chroma_format_idc"] == 0:
+            crop_unit_x, crop_unit_y = 1, 2 - frame_mbs_only
+        elif ret["chroma_format_idc"] == 1:
+            crop_unit_x, crop_unit_y = 2, 2 * (2 - frame_mbs_only)
+        elif ret["chroma_format_idc"] == 2:
+            crop_unit_x, crop_unit_y = 2, 1 * (2 - frame_mbs_only)
+        elif ret["chroma_format_idc"] == 3:
+            crop_unit_x, crop_unit_y = 1, 1 * (2 - frame_mbs_only)
+        else:
+            raise ValueError("invalid chroma format idc")
+
+        ret["frame_crop_left_offset"] = s.read("ue")
+        ret["frame_crop_right_offset"] = s.read("ue")
+        ret["frame_crop_top_offset"] = s.read("ue")
+        ret["frame_crop_bottom_offset"] = s.read("ue")
+
+        frame_crop_width = ret["frame_crop_left_offset"] + ret["frame_crop_right_offset"]
+        frame_crop_height = ret["frame_crop_top_offset"] + ret["frame_crop_bottom_offset"]
+        ret["width"] -= frame_crop_width * crop_unit_x
+        ret["height"] -= frame_crop_height * crop_unit_y
+
+    ret["vui_parameters_present_flag"] = s.read("uint:1")
+    if ret["vui_parameters_present_flag"]:
+        ret["aspect_ratio_info_present_flag"] = s.read("uint:1")
+        if ret["aspect_ratio_info_present_flag"]:
+            ret["aspect_ratio_idc"] = s.read("uint:8")
+            if ret["aspect_ratio_idc"] == 255:
+                ret["sar_width"] = s.read("uint:16")
+                ret["sar_height"] = s.read("uint:16")
+        ret["overscan_info_present_flag"] = s.read("uint:1")
+        if ret["overscan_info_present_flag"]:
+            ret["overscan_appropriate_flag"] = s.read("uint:1")
+        ret["video_signal_type_present_flag"] = s.read("uint:1")
+        if ret["video_signal_type_present_flag"]:
+            ret["video_format"] = s.read("uint:3")
+            ret["video_full_range_flag"] = s.read("uint:1")
+            ret["colour_description_present_flag"] = s.read("uint:1")
+            if ret["colour_description_present_flag"]:
+                ret["colour_primaries"] = s.read("uint:8")
+                ret["transfer_characteristics"] = s.read("uint:8")
+                ret["matrix_coefficients"] = s.read("uint:8")
+        ret["chroma_loc_info_present_flag"] = s.read("uint:1")
+        if ret["chroma_loc_info_present_flag"]:
+            ret["chroma_sample_loc_type_top_field"] = s.read("ue")
+            ret["chroma_sample_loc_type_bottom_field"] = s.read("ue")
+        ret["vui_timing_info_present_flag"] = s.read("uint:1")
+        if ret["vui_timing_info_present_flag"]:
+            ret["vui_num_units_in_tick"] = s.read("uint:32")
+            ret["vui_time_scale"] = s.read("uint:32")
+            ret["vui_fixed_framerate_flag"] = s.read("uint:1")
+    return ret
+
+
+def parse_hevc_sps(data) -> dict:
+    spsLen = len(data)
+    ret = {}
+
+    c = bitstring.BitArray(bytes=data, length=spsLen * 8)
+    newStr = to_rbsp(c.hex)
+    s = bitstring.BitStream("0x" + newStr)
+
+    s.read("uint:16")
+    ret["sps_video_parameter_set_id"] = s.read("uint:4")
+    ret["sps_max_sub_layers"] = s.read("uint:3") + 1
+    ret["sps_temporal_id_nesting_flag"] = s.read("uint:1")
+    ret["general_profile_space"] = s.read("uint:2")
+    ret["general_tier_flag"] = s.read("uint:1")
+    ret["general_profile_idc"] = s.read("uint:5")
+    ret["general_compatibility_flags"] = s.read("uint:32")
+    ret["general_progressive_source_flag"] = s.read("uint:1")
+    ret["general_interlaced_source_flag"] = s.read("uint:1")
+    ret["general_non_packed_constraint_flag"] = s.read("uint:1")
+    ret["general_frame_only_constraint_flag"] = s.read("uint:1")
+    s.read("uint:32")
+    s.read("uint:12")
+    ret["general_level_idc"] = s.read("uint:8")
+
+    if ret["sps_max_sub_layers"] >= 2:
+        max_num_sub_layers = ret["sps_max_sub_layers"]
+        for _ in range(max_num_sub_layers - 1):
+            s.read("uint:1")
+            s.read("uint:1")
+        k = max_num_sub_layers - 1
+        while k < 8:
+            s.read("uint:2")
+            k += 1
+
+    ret["sps_seq_parameter_set_id"] = s.read("ue")
+    ret["chroma_format_idc"] = s.read("ue")
+    if ret["chroma_format_idc"] == 3:
+        ret["separate_colour_plane_flag"] = s.read("uint:1")
+    ret["pic_width_in_luma_samples"] = s.read("ue")
+    ret["pic_height_in_luma_samples"] = s.read("ue")
+    ret["conformance_window_flag"] = s.read("uint:1")
+    if ret["conformance_window_flag"]:
+        ret["conf_win_left_offset"] = s.read("ue")
+        ret["conf_win_right_offset"] = s.read("ue")
+        ret["conf_win_top_offset"] = s.read("ue")
+        ret["conf_win_bottom_offset"] = s.read("ue")
+    ret["bit_depth_luma"] = s.read("ue") + 8
+    ret["bit_depth_chroma"] = s.read("ue") + 8
+    ret["log2_max_pic_order_cnt_lsb"] = s.read("ue") + 4
+    ret["sps_sub_layer_ordering_info"] = s.read("uint:1")
+
+    if ret["sps_sub_layer_ordering_info"]:
+        k = 0
+    else:
+        k = ret["sps_max_sub_layers"] - 1
+    while k <= ret["sps_max_sub_layers"] - 1:
+        s.read("ue")
+        s.read("ue")
+        s.read("ue")
+        k += 1
+
+    ret["log2_min_coding_block_size"] = s.read("ue") + 3
+    ret["log2_diff_max_min_coding_block_size"] = s.read("ue")
+    ret["log2_min_transform_block_size"] = s.read("ue") + 2
+    ret["log2_diff_max_min_transform_block_size"] = s.read("ue")
+    ret["max_transform_hierarchy_depth_inter"] = s.read("ue")
+    ret["max_transform_hierarchy_depth_intra"] = s.read("ue")
+    ret["scaling_list_enabled_flag"] = s.read("uint:1")
+    assert ret["scaling_list_enabled_flag"] == 0
+    ret["amp_enabled_flag"] = s.read("uint:1")
+    ret["sample_adaptive_offset_enabled_flag"] = s.read("uint:1")
+    ret["pcm_enabled_flag"] = s.read("uint:1")
+    if ret["pcm_enabled_flag"]:
+        s.read("uint:4")
+        s.read("uint:4")
+        s.read("ue")
+        s.read("ue")
+        s.read("uint:1")
+
+    ret["num_short_term_ref_pic_sets"] = s.read("ue")
+    numRefs = 0
+    if ret["num_short_term_ref_pic_sets"] > 0:
+        for k in range(ret["num_short_term_ref_pic_sets"]):
+            inter_ref_pic_set_prediction_flag = 0
+            if k > 0:
+                inter_ref_pic_set_prediction_flag = s.read("uint:1")
+            if inter_ref_pic_set_prediction_flag:
+                refFrames = 0
+                for _ in range(numRefs + 1):
+                    used_by_curr_pic_flag = s.read("uint:1")
+                    if used_by_curr_pic_flag != 0:
+                        refFrames += 1
+                numRefs = refFrames
+            else:
+                num_negative_pics = s.read("ue")
+                num_positive_pics = s.read("ue")
+                numRefs = num_negative_pics + num_positive_pics
+                for _ in range(num_negative_pics):
+                    s.read("ue")
+                    s.read("uint:1")
+                for _ in range(num_positive_pics):
+                    s.read("ue")
+                    s.read("uint:1")
+
+    ret["long_term_ref_pics_present_flag"] = s.read("uint:1")
+    if ret["long_term_ref_pics_present_flag"]:
+        num_long_term_ref_pics = s.read("ue")
+        for _ in range(num_long_term_ref_pics):
+            s.read(f"uint:{ret['log2_max_pic_order_cnt_lsb']}")
+            s.read("uint:1")
+
+    ret["sps_temporal_mvp_enable_flag"] = s.read("uint:1")
+    ret["sps_strong_intra_smoothing_enable_flag"] = s.read("uint:1")
+    ret["vui_parameters_present_flag"] = s.read("uint:1")
+    if ret["vui_parameters_present_flag"]:
+        ret["aspect_ratio_info_present_flag"] = s.read("uint:1")
+        if ret["aspect_ratio_info_present_flag"]:
+            ret["aspect_ratio_idc"] = s.read("uint:8")
+            if ret["aspect_ratio_idc"] == 255:
+                ret["sar_width"] = s.read("uint:16")
+                ret["sar_height"] = s.read("uint:16")
+        ret["overscan_info_present_flag"] = s.read("uint:1")
+        if ret["overscan_info_present_flag"]:
+            ret["overscan_appropriate_flag"] = s.read("uint:1")
+        ret["video_signal_type_present_flag"] = s.read("uint:1")
+        if ret["video_signal_type_present_flag"]:
+            ret["video_format"] = s.read("uint:3")
+            ret["video_full_range_flag"] = s.read("uint:1")
+            ret["colour_description_present_flag"] = s.read("uint:1")
+            if ret["colour_description_present_flag"]:
+                ret["colour_primaries"] = s.read("uint:8")
+                ret["transfer_characteristics"] = s.read("uint:8")
+                ret["matrix_coefficients"] = s.read("uint:8")
+        ret["chroma_loc_info_present_flag"] = s.read("uint:1")
+        if ret["chroma_loc_info_present_flag"]:
+            ret["chroma_sample_loc_type_top_field"] = s.read("ue")
+            ret["chroma_sample_loc_type_bottom_field"] = s.read("ue")
+        ret["neutral_chroma_indication_flag"] = s.read("uint:1")
+        ret["field_seq_flag"] = s.read("uint:1")
+        ret["frame_field_info_present_flag"] = s.read("uint:1")
+        ret["default_display_window_flag"] = s.read("uint:1")
+        if ret["default_display_window_flag"]:
+            ret["def_disp_win_left_offset"] = s.read("ue")
+            ret["def_disp_win_right_offset"] = s.read("ue")
+            ret["def_disp_win_top_offset"] = s.read("ue")
+            ret["def_disp_win_bottom_offset"] = s.read("ue")
+        ret["vui_timing_info_present_flag"] = s.read("uint:1")
+        if ret["vui_timing_info_present_flag"]:
+            ret["vui_num_units_in_tick"] = s.read("uint:32")
+            ret["vui_time_scale"] = s.read("uint:32")
+            ret["vui_poc_proportional_to_timing_flag"] = s.read("uint:1")
+            if ret["vui_poc_proportional_to_timing_flag"]:
+                ret["vui_num_ticks_poc_diff_one"] = s.read("ue") + 1
+        ret["hrd_parameters_present_flag"] = s.read("uint:1")
+    ret["sps_extension_flag"] = s.read("uint:1")
+    return ret
+
+
+def get_real_fps_from_codec_private_data(codec, codec_private_data):
+    if not codec_private_data:
+        return None
+    try:
+        if isinstance(codec_private_data, bytes):
+            blob = bytes(codec_private_data)
+        else:
+            cleaned = str(codec_private_data).strip().replace(" ", "").replace("-", "")
+            if not cleaned:
+                return None
+            blob = binascii.unhexlify(cleaned.encode())
+        arr = blob.split(u32.pack(1))
+        codec_lower = str(codec or "").lower()
+        if codec_lower == "avc1":
+            sps = next((x for x in arr if x and (x[0] & 0x1F) == 7), None)
+            if not sps:
+                return None
+            sps_data = parse_avc_sps(sps)
+            if "vui_num_units_in_tick" in sps_data and "vui_time_scale" in sps_data and sps_data["vui_num_units_in_tick"]:
+                return sps_data["vui_time_scale"] / sps_data["vui_num_units_in_tick"] / 2
+            return None
+        if codec_lower in ("hvc1", "hev1", "dvhe", "dvh1"):
+            sps = next((x for x in arr if x and ((x[0] >> 1) == 0x21)), None)
+            if not sps:
+                return None
+            sps_data = parse_hevc_sps(sps)
+            if "vui_num_units_in_tick" in sps_data and "vui_time_scale" in sps_data and sps_data["vui_num_units_in_tick"]:
+                return sps_data["vui_time_scale"] / sps_data["vui_num_units_in_tick"]
+    except Exception:
+        return None
+    return None
 
 
 class BinaryWriter:
